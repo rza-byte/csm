@@ -225,12 +225,12 @@ cmd_attach() {
         return
     fi
 
-    # New session — window 0 is the dashboard
+    # New session — first window is the dashboard (index depends on tmux base-index)
     tmux new-session -d -s "$CSM_SESSION" -n '[dashboard]'
     tmux set-option -t "$CSM_SESSION" status off   # dashboard IS the status UI
     tmux set-option -t "$CSM_SESSION" history-limit 50000  # cap scrollback (WSL2 memory)
 
-    tmux send-keys -t "${CSM_SESSION}:0" 'csm _dashboard' Enter
+    tmux send-keys -t "${CSM_SESSION}:[dashboard]" 'csm _dashboard' Enter
 
     _log_audit "attach" "created new csm session"
 
