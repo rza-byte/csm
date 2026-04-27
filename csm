@@ -1,0 +1,504 @@
+#!/usr/bin/env bash
+# csm — Claude Session Manager
+# https://github.com/rza-byte/csm
+
+set -euo pipefail
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+CSM_SESSION="csm"
+CSM_LIB_DIR="${CSM_LIB_DIR:-$HOME/.local/share/csm/lib}"
+CSM_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/csm"
+CSM_AUDIT_LOG="$CSM_STATE_DIR/audit.log"
+CLAUDE_SESSIONS="$HOME/.claude/sessions"
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+RED=$'\033[0;31m';  YELLOW=$'\033[0;33m'; GREEN=$'\033[0;32m'
+GREY=$'\033[0;90m'; BOLD=$'\033[1m';      RESET=$'\033[0m'
+CYAN=$'\033[0;36m'
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+_log_audit() {
+    mkdir -p "$CSM_STATE_DIR"
+    echo "$(date -Iseconds) $*" >> "$CSM_AUDIT_LOG"
+}
+
+_ensure_state_dir() {
+    mkdir -p "$CSM_STATE_DIR"
+}
+
+# Returns TSV: pid\talive\tstatus\tcwd\tproject\tage_min
+_get_sessions() {
+    python3 "$CSM_LIB_DIR/csm-status.py" sessions 2>/dev/null || true
+}
+
+# Graceful kill: SIGTERM, wait up to 10s, then SIGKILL
+_safe_kill_claude() {
+    local pid="$1"
+    [[ -d "/proc/$pid" ]] || return 0
+    kill -TERM "$pid" 2>/dev/null || true
+    local n=0
+    while [[ -d "/proc/$pid" ]] && (( n < 10 )); do
+        sleep 1; (( n++ ))
+    done
+    [[ -d "/proc/$pid" ]] && kill -KILL "$pid" 2>/dev/null || true
+}
+
+# Get Claude child PID from a tmux window's shell PID
+_window_claude_pid() {
+    local win="$1"
+    local pane_pid
+    pane_pid=$(tmux display-message -t "${CSM_SESSION}:${win}" -p '#{pane_pid}' 2>/dev/null) || return 1
+    pgrep -P "$pane_pid" -f "claude" 2>/dev/null | head -1 || \
+    pgrep -P "$pane_pid" 2>/dev/null | head -1 || true
+}
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+
+_render_dashboard() {
+    local data
+    data=$(_get_sessions)
+
+    tput clear
+    printf "${BOLD}CSM — Claude Session Manager${RESET}  %s\n" "$(date '+%a %b %d %H:%M:%S')"
+    printf '%0.s─' {1..70}; echo
+    printf "\n  ${BOLD}%-4s  %-8s  %-28s  %-6s  %s${RESET}\n" "WIN" "STATUS" "PROJECT" "AGE" "CWD"
+    printf '  %s\n' '───  ────────  ────────────────────────────  ──────  ──────────────────────'
+
+    if [[ -z "$data" ]]; then
+        printf "\n  ${GREY}No Claude sessions found. Press N to start one.${RESET}\n"
+    else
+        local win=1
+        while IFS=$'\t' read -r pid alive st cwd project age_min; do
+            local icon color
+            if [[ "$alive" != "True" ]]; then
+                icon="\xF0\x9F\x92\x80"; color="$GREY"  # 💀
+            else
+                case "$st" in
+                    busy)    icon="●"; color="$RED" ;;
+                    waiting) icon="⏳"; color="$YELLOW" ;;
+                    idle)    icon="○"; color="$GREEN" ;;
+                    *)       icon="?"; color="$GREY" ;;
+                esac
+            fi
+            local short_cwd
+            short_cwd=$(echo "$cwd" | sed "s|$HOME|~|")
+            printf "  ${BOLD}[%d]${RESET}  ${color}%s %-7s${RESET}  %-28s  %-6s  %s\n" \
+                "$win" "$icon" "$st" "${project:0:27}" "${age_min}m" "${short_cwd:0:38}"
+            (( win++ ))
+        done <<< "$data"
+    fi
+
+    printf '\n%0.s─' {1..70}; echo
+    printf "\n  ${CYAN}[1-9]${RESET} Switch  ${CYAN}[N]${RESET} New session  ${CYAN}[J]${RESET} Jump by name  ${CYAN}[K]${RESET} Kill\n"
+    printf "  ${CYAN}[L]${RESET} Log tail  ${CYAN}[A]${RESET} Adopt orphans  ${CYAN}[R]${RESET} Refresh  ${CYAN}[Q]${RESET} Quit/detach\n\n"
+}
+
+# Dashboard loop: inotify-driven refresh with 3s fallback timer
+_dashboard_loop() {
+    local inotify_pipe=""
+    local inotify_pid=""
+
+    if command -v inotifywait &>/dev/null; then
+        inotify_pipe=$(mktemp -u /tmp/csm-inotify-XXXXXX).pipe
+        mkfifo "$inotify_pipe" 2>/dev/null || inotify_pipe=""
+        if [[ -n "$inotify_pipe" ]]; then
+            inotifywait -m "$CLAUDE_SESSIONS" -e modify,create,delete \
+                --format '%e' -q > "$inotify_pipe" 2>/dev/null &
+            inotify_pid=$!
+        fi
+    fi
+
+    trap '
+        [[ -n "$inotify_pid" ]] && kill "$inotify_pid" 2>/dev/null || true
+        [[ -n "$inotify_pipe" ]] && rm -f "$inotify_pipe" || true
+    ' EXIT INT TERM
+
+    while true; do
+        _render_dashboard
+
+        local key=""
+        if read -rs -n1 -t3 key 2>/dev/null; then
+            case "$key" in
+                [1-9])
+                    tmux select-window -t "${CSM_SESSION}:${key}" 2>/dev/null || true
+                    ;;
+                n|N) _new_popup ;;
+                j|J) _jump_prompt ;;
+                k|K) _kill_prompt ;;
+                l|L) _log_prompt ;;
+                a|A)
+                    tput clear
+                    cmd_adopt
+                    read -rs -n1 -p $'\nPress any key...' 2>/dev/null || true
+                    ;;
+                r|R) continue ;;
+                q|Q)
+                    tmux detach-client 2>/dev/null || true
+                    break
+                    ;;
+            esac
+        fi
+
+        # Drain any pending inotify events so next render is immediate
+        if [[ -n "$inotify_pipe" ]] && [[ -p "$inotify_pipe" ]]; then
+            read -t0.05 _ < "$inotify_pipe" 2>/dev/null || true
+        fi
+    done
+}
+
+_new_popup() {
+    if [[ -n "${TMUX:-}" ]]; then
+        # Build display-menu from recent dirs
+        local dirs=(); mapfile -t dirs < <(python3 "$CSM_LIB_DIR/csm-status.py" recent-dirs 2>/dev/null | head -9)
+        local -a menu_args=("-T" "New Claude Session")
+        local cur_dir="$PWD"
+        menu_args+=("$(basename "$cur_dir") (current)" "0" "run-shell 'csm new \"$cur_dir\"'")
+        local i=1
+        for dir in "${dirs[@]}"; do
+            [[ -d "$dir" ]] || continue
+            [[ "$dir" == "$cur_dir" ]] && continue
+            local name; name=$(basename "$dir")
+            menu_args+=("$i: $name" "$i" "run-shell 'csm new \"$dir\"'")
+            (( i++ ))
+        done
+        menu_args+=( "" "" "")
+        menu_args+=("Enter path manually..." "e" "command-prompt -p 'Directory:' 'run-shell \"csm new \"\"%%\"\"\"'")
+        tmux display-menu "${menu_args[@]}" 2>/dev/null || true
+    else
+        printf "\n  Directory (Enter for current): "
+        local dir; read -re dir
+        [[ -z "$dir" ]] && dir="$PWD"
+        cmd_new "$dir"
+        read -rs -n1 -p $'  Press any key...\n' 2>/dev/null || true
+    fi
+}
+
+_jump_prompt() {
+    printf "\n  Jump to (name or number): "
+    local query; read -r query
+    [[ -z "$query" ]] && return
+    if [[ "$query" =~ ^[0-9]+$ ]]; then
+        tmux select-window -t "${CSM_SESSION}:${query}" 2>/dev/null || \
+            printf "  No window %s\n" "$query"
+    else
+        local win
+        win=$(tmux list-windows -t "$CSM_SESSION" -F '#{window_index} #{window_name}' 2>/dev/null \
+            | grep -i "$query" | head -1 | awk '{print $1}') || true
+        if [[ -n "$win" ]]; then
+            tmux select-window -t "${CSM_SESSION}:${win}"
+        else
+            printf "  No session matching '%s'\n" "$query"
+            sleep 1
+        fi
+    fi
+}
+
+_kill_prompt() {
+    printf "\n  Kill window number: "
+    local win; read -r win
+    [[ "$win" =~ ^[0-9]+$ ]] || return
+    cmd_kill "$win"
+    read -rs -n1 -p $'  Press any key...\n' 2>/dev/null || true
+}
+
+_log_prompt() {
+    printf "\n  Log for window number: "
+    local win; read -r win
+    [[ "$win" =~ ^[0-9]+$ ]] || return
+    tmux display-popup -E -w 90% -h 85% \
+        "bash -c 'python3 \"$CSM_LIB_DIR/csm-status.py\" log \"$win\"; echo; read -rs -n1 -p \"Press any key...\"'" \
+        2>/dev/null || cmd_log "$win"
+}
+
+# ── Subcommands ───────────────────────────────────────────────────────────────
+
+cmd_attach() {
+    _ensure_state_dir
+
+    if tmux has-session -t "$CSM_SESSION" 2>/dev/null; then
+        if [[ -n "${TMUX:-}" ]]; then
+            tmux switch-client -t "$CSM_SESSION"
+        else
+            tmux attach-session -t "$CSM_SESSION"
+        fi
+        return
+    fi
+
+    # New session — window 0 is the dashboard
+    tmux new-session -d -s "$CSM_SESSION" -n '[dashboard]'
+    tmux set-option -t "$CSM_SESSION" status off   # dashboard IS the status UI
+    tmux set-option -t "$CSM_SESSION" history-limit 50000  # cap scrollback (WSL2 memory)
+
+    tmux send-keys -t "${CSM_SESSION}:0" 'csm _dashboard' Enter
+
+    _log_audit "attach" "created new csm session"
+
+    if [[ -n "${TMUX:-}" ]]; then
+        tmux switch-client -t "$CSM_SESSION"
+    else
+        tmux attach-session -t "$CSM_SESSION"
+    fi
+}
+
+cmd_new() {
+    local target_dir="${1:-}"
+
+    if [[ -z "$target_dir" ]]; then
+        if [[ -n "${TMUX:-}" ]]; then
+            _new_popup
+            return
+        else
+            printf "Directory (Enter for current dir): "
+            read -re target_dir
+            [[ -z "$target_dir" ]] && target_dir="$PWD"
+        fi
+    fi
+
+    target_dir="${target_dir/#\~/$HOME}"
+    target_dir=$(realpath "$target_dir" 2>/dev/null || echo "$target_dir")
+
+    if [[ ! -d "$target_dir" ]]; then
+        echo "Error: not a directory: $target_dir" >&2; return 1
+    fi
+
+    local project
+    project=$(basename "$target_dir")
+
+    # Read per-project .csmrc (walk up from target_dir)
+    local kube_ctx="" aws_prof=""
+    local rc_file=""
+    local search_dir="$target_dir"
+    while [[ "$search_dir" != "/" ]]; do
+        if [[ -f "$search_dir/.csmrc" ]]; then
+            rc_file="$search_dir/.csmrc"
+            break
+        fi
+        search_dir=$(dirname "$search_dir")
+    done
+    if [[ -n "$rc_file" ]]; then
+        kube_ctx=$(grep -E '^kube_context=' "$rc_file" 2>/dev/null | cut -d= -f2 | tr -d '"' || true)
+        aws_prof=$(grep -E '^aws_profile='   "$rc_file" 2>/dev/null | cut -d= -f2 | tr -d '"' || true)
+    fi
+
+    # Build shell command: cd, optionally set context, then launch claude
+    local launch_cmd="cd '$target_dir'"
+    [[ -n "$kube_ctx" ]] && launch_cmd+="; kubectl config use-context '$kube_ctx' 2>/dev/null && echo '  k8s: $kube_ctx'"
+    [[ -n "$aws_prof" ]] && launch_cmd+="; export AWS_PROFILE='$aws_prof' && echo '  aws: $aws_prof'"
+    launch_cmd+="; exec claude"
+
+    # Ensure csm tmux session exists
+    if ! tmux has-session -t "$CSM_SESSION" 2>/dev/null; then
+        echo "CSM session not running. Starting it first..."
+        cmd_attach &
+        sleep 0.5
+    fi
+
+    tmux new-window -t "$CSM_SESSION" -n "○ ${project}" "zsh -c '$launch_cmd'"
+
+    local ctx_note=""
+    [[ -n "$kube_ctx" ]] && ctx_note+=" [k8s:$kube_ctx]"
+    [[ -n "$aws_prof" ]] && ctx_note+=" [aws:$aws_prof]"
+    _log_audit "new" "$target_dir" "$ctx_note"
+    echo "Opened: $project$ctx_note"
+}
+
+cmd_kill() {
+    local win="${1:-}"
+    if [[ -z "$win" ]]; then
+        printf "Kill window number: "; read -r win
+    fi
+    [[ "$win" =~ ^[0-9]+$ ]] || { echo "Invalid window number: $win" >&2; return 1; }
+
+    local claude_pid
+    claude_pid=$(_window_claude_pid "$win" 2>/dev/null) || true
+
+    if [[ -n "$claude_pid" ]]; then
+        printf "Sending SIGTERM to Claude PID %s ..." "$claude_pid"
+        _safe_kill_claude "$claude_pid"
+        echo " done."
+    fi
+
+    tmux kill-window -t "${CSM_SESSION}:${win}" 2>/dev/null || true
+    _log_audit "kill" "window=$win" "pid=${claude_pid:-unknown}"
+    echo "Killed window $win"
+}
+
+cmd_list() {
+    printf "${BOLD}%-8s  %-8s  %-5s  %-30s  %s${RESET}\n" "PID" "STATUS" "AGE" "PROJECT" "CWD"
+    printf '%0.s─' {1..80}; echo
+    while IFS=$'\t' read -r pid alive st cwd project age_min; do
+        local dead_marker=""
+        [[ "$alive" != "True" ]] && dead_marker="  ${GREY}[dead]${RESET}"
+        printf "%-8s  %-8s  %-5s  %-30s  %s%b\n" \
+            "$pid" "$st" "${age_min}m" "${project:0:29}" "${cwd}" "$dead_marker"
+    done < <(_get_sessions)
+}
+
+cmd_log() {
+    local win="${1:-}"
+    [[ -z "$win" ]] && { printf "Window number: "; read -r win; }
+    python3 "$CSM_LIB_DIR/csm-status.py" log "$win"
+}
+
+cmd_jump() {
+    local query="${1:-}"
+    [[ -z "$query" ]] && { printf "Session name or number: "; read -r query; }
+
+    if [[ "$query" =~ ^[0-9]+$ ]]; then
+        tmux select-window -t "${CSM_SESSION}:${query}" 2>/dev/null || echo "No window $query"
+        return
+    fi
+
+    local win
+    win=$(tmux list-windows -t "$CSM_SESSION" -F '#{window_index} #{window_name}' 2>/dev/null \
+        | grep -i "$query" | head -1 | awk '{print $1}') || true
+
+    if [[ -n "$win" ]]; then
+        tmux select-window -t "${CSM_SESSION}:${win}"
+    else
+        echo "No session matching '$query'"
+    fi
+}
+
+cmd_adopt() {
+    echo "Scanning for orphan Claude sessions (running outside CSM)..."
+    local found=0 adopted=0
+
+    while IFS=$'\t' read -r pid alive st cwd project age_min; do
+        [[ "$alive" != "True" ]] && continue
+
+        # Check if this PID is already a child of any CSM tmux pane
+        local managed=false
+        if tmux has-session -t "$CSM_SESSION" 2>/dev/null; then
+            while IFS= read -r pane_pid; do
+                local child_pid
+                child_pid=$(pgrep -P "$pane_pid" -f "claude" 2>/dev/null | head -1 || true)
+                if [[ "$child_pid" == "$pid" ]]; then
+                    managed=true; break
+                fi
+            done < <(tmux list-panes -t "$CSM_SESSION" -a -F '#{pane_pid}' 2>/dev/null)
+        fi
+
+        if [[ "$managed" == "false" ]]; then
+            (( found++ ))
+            printf "  Found orphan: PID %-8s  %-20s  %s\n" "$pid" "$project" "$cwd"
+            printf "  Kill & relaunch under CSM? [y/N]: "
+            local ans; read -r ans
+            if [[ "$ans" =~ ^[Yy]$ ]]; then
+                _safe_kill_claude "$pid"
+                sleep 0.3
+                cmd_new "$cwd"
+                (( adopted++ ))
+            fi
+        fi
+    done < <(_get_sessions)
+
+    if (( found == 0 )); then
+        echo "  No orphans found — all Claude sessions are managed by CSM."
+    else
+        echo "  Adopted $adopted of $found orphan(s)."
+    fi
+}
+
+cmd_doctor() {
+    printf "${BOLD}=== CSM Doctor ===${RESET}\n\n"
+
+    printf "  ${BOLD}Required:${RESET}\n"
+    for dep in tmux python3 zsh; do
+        if command -v "$dep" &>/dev/null; then
+            printf "  %-14s ${GREEN}✓${RESET} %s\n" "$dep" "$(command -v "$dep")"
+        else
+            printf "  %-14s ${RED}✗ NOT FOUND${RESET}\n" "$dep"
+        fi
+    done
+
+    printf "\n  ${BOLD}Optional (improves experience):${RESET}\n"
+    printf "  %-14s %s\n" "fzf" "better directory picker (apt install fzf)"
+    printf "  %-14s %s\n" "inotifywait" "real-time updates (apt install inotify-tools)"
+    printf "  %-14s %s\n" "notify-send" "desktop notifications (apt install libnotify-bin)"
+    for dep in fzf inotifywait notify-send; do
+        if command -v "$dep" &>/dev/null; then
+            printf "  %-14s ${GREEN}✓${RESET} installed\n" "$dep"
+        else
+            printf "  %-14s ${GREY}-${RESET} not installed\n" "$dep"
+        fi
+    done
+
+    printf "\n  ${BOLD}Claude sessions:${RESET}\n"
+    local live=0 dead=0
+    while IFS=$'\t' read -r _ alive _; do
+        [[ "$alive" == "True" ]] && (( live++ )) || (( dead++ ))
+    done < <(_get_sessions)
+    printf "  Live: %d   Dead: %d\n" "$live" "$dead"
+
+    printf "\n  ${BOLD}CSM tmux session:${RESET}\n"
+    if tmux has-session -t "$CSM_SESSION" 2>/dev/null; then
+        local nwin; nwin=$(tmux list-windows -t "$CSM_SESSION" 2>/dev/null | wc -l)
+        printf "  ${GREEN}Running${RESET} (%d windows)\n" "$nwin"
+    else
+        printf "  ${GREY}Not running${RESET}\n"
+    fi
+
+    printf "\n  ${BOLD}Paths:${RESET}\n"
+    printf "  Lib dir:   %s\n" "$CSM_LIB_DIR"
+    printf "  State dir: %s\n" "$CSM_STATE_DIR"
+    printf "  Audit log: %s\n" "$CSM_AUDIT_LOG"
+
+    printf "\n  ${BOLD}Schema check:${RESET}\n"
+    python3 "$CSM_LIB_DIR/csm-status.py" schema-check 2>/dev/null || \
+        echo "  Could not run schema check."
+}
+
+cmd_help() {
+    cat <<'EOF'
+csm — Claude Session Manager
+
+USAGE:
+  csm                  Launch or attach to the CSM dashboard
+  csm new [DIR]        Open new Claude session in DIR (default: interactive pick)
+  csm kill [WIN]       Gracefully kill session by window number
+  csm list             List all Claude sessions
+  csm log [WIN]        Tail the transcript for a session
+  csm jump [NAME]      Switch to session by name or number
+  csm adopt            Detect and re-manage orphan Claude sessions
+  csm doctor           Check dependencies and session health
+  csm help             Show this help
+
+DASHBOARD KEYS:
+  1-9    Switch to window       N   New session
+  J      Jump by name           K   Kill session (graceful)
+  L      Log tail (popup)       A   Adopt orphans
+  R      Force refresh          Q   Quit (detach from tmux)
+
+PER-PROJECT CONFIG (.csmrc in repo root):
+  kube_context=cgk8s-dev-cluster
+  aws_profile=hyp-creditguard
+
+OPTIONAL DEPENDENCIES:
+  fzf              Better directory picker  (apt install fzf)
+  inotify-tools    Real-time updates        (apt install inotify-tools)
+  libnotify-bin    Desktop notifications    (apt install libnotify-bin)
+EOF
+}
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+
+main() {
+    case "${1:-}" in
+        new)          shift; cmd_new "$@" ;;
+        kill|rm)      shift; cmd_kill "$@" ;;
+        list|ls)      cmd_list ;;
+        log)          shift; cmd_log "$@" ;;
+        jump)         shift; cmd_jump "$@" ;;
+        adopt)        cmd_adopt ;;
+        doctor)       cmd_doctor ;;
+        install)      bash "$(dirname "${BASH_SOURCE[0]}")/install.sh" ;;
+        help|-h|--help) cmd_help ;;
+        _dashboard)   _dashboard_loop ;;
+        "")           cmd_attach ;;
+        *)            echo "Unknown command: $1"; echo; cmd_help; exit 1 ;;
+    esac
+}
+
+main "$@"
